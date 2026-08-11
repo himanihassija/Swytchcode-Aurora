@@ -83,6 +83,32 @@ def api_run_pipeline():
     return api_state()
 
 
+@app.route("/api/schedule-meeting", methods=["POST"])
+def api_schedule_meeting():
+    data = request.json or {}
+    attendee_name = (data.get("attendee_name") or "").strip()
+    attendee_email = (data.get("attendee_email") or "").strip()
+    company = (data.get("company") or "").strip()
+    topic = (data.get("topic") or "").strip()
+    context = (data.get("context") or "").strip()
+    date_str = (data.get("date") or "").strip() or None
+    time_str = (data.get("time") or "").strip() or None
+
+    if not attendee_name or not topic:
+        return jsonify({"error": "Attendee name and topic are required."}), 400
+
+    core.create_manual_meeting(
+        attendee_name=attendee_name,
+        attendee_email=attendee_email,
+        company=company,
+        topic=topic,
+        context=context,
+        date_str=date_str,
+        time_str=time_str,
+    )
+    return api_state()
+
+
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
     question = (request.json or {}).get("question", "").strip()
