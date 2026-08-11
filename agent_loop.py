@@ -53,6 +53,9 @@ def run_swytchcode(*args: str) -> subprocess.CompletedProcess:
     return result
 LOGO_URL = "https://raw.githubusercontent.com/himanihassija/Swytchcode-Aurora-Himani-Hassija/main/aurora_logo.png"
 CALENDAR_ID = "f60a9f1d42cd19be5c7b007633d79700d736661ccce017fa446416272dcd1034@group.calendar.google.com"
+# Everyone who should get a calendar invite (and see the event on their own
+# calendar) in addition to whoever's on CALENDAR_ID.
+MEETING_ATTENDEES = ["24f3000056@ds.study.iitm.ac.in", "himanihassija1609@gmail.com"]
 SLACK_CHANNEL = "C0BNPFZ9YAX"
 # LOGO_URL (defined above) doubles as the Slack message avatar. Slack fetches
 # this URL server-side, so it must be a real hosted image link — a local file
@@ -220,7 +223,7 @@ def save_memory(memory: dict):
 
 def ask_llm(prompt: str) -> str:
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=1024,
     )
@@ -287,15 +290,94 @@ the date {tomorrow} exactly, only the time portion is yours to choose:
             "description": "Agenda:\n" + "\n".join(f"- {item}" for item in plan.get("agenda", [])),
             "start": {"dateTime": plan.get("start_time")},
             "end": {"dateTime": plan.get("end_time")},
+            "attendees": [{"email": email} for email in MEETING_ATTENDEES],
         }, f)
     run_swytchcode(
         "exec", "calendar.calendar.events.create",
         "--body", "calendar_event.json",
         "--input", f"calendarId={CALENDAR_ID}",
+        "--input", "sendUpdates=all",
         "--json",
     )
     slack_notify(f"Meeting scheduled with *{meeting['attendee_name']}* on {plan.get('start_time', '')[:10]} — _{meeting['topic']}_")
     return plan
+
+
+# --------------------------------------------------------------------------
+# Manual scheduling — triggered from the dashboard "New meeting" form rather
+# than from the seeded `meetings` list. Creates the real Calendar event (with
+# attendees + Slack note), then adds the meeting to memory and to the
+# in-memory `meetings` list so it shows up on the dashboard right away.
+# --------------------------------------------------------------------------
+def create_manual_meeting(
+    attendee_name: str,
+    attendee_email: str = "",
+    company: str = "",
+    topic: str = "",
+    context: str = "",
+    date_str: str | None = None,
+    time_str: str | None = None,
+) -> dict:
+    meeting_date = date_str or (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    start_time = f"{meeting_date}T{time_str or '10:00:00'}+05:30"
+    end_time = (datetime.fromisoformat(start_time) + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S+05:30")
+
+    prompt = f"""You are a scheduling assistant. Write a short 3-bullet agenda for
+this meeting.
+
+Meeting: {topic} with {attendee_name} at {company}
+Context: {context}
+
+Respond in this exact JSON format, nothing else:
+{{"agenda": ["...", "...", "..."]}}
+"""
+    plan = ask_llm_json(prompt)
+    agenda = plan.get("agenda", []) if plan else []
+
+    meeting_id = "manual-" + datetime.now().strftime("%Y%m%d%H%M%S")
+
+    # De-duped: our two default attendees, plus this meeting's actual
+    # attendee email if one was given and it isn't already in the list.
+    attendees = list(dict.fromkeys(MEETING_ATTENDEES + ([attendee_email] if attendee_email else [])))
+
+    with open("calendar_event.json", "w") as f:
+        json.dump({
+            "summary": f"{topic} — {attendee_name}" + (f" ({company})" if company else ""),
+            "description": "Agenda:\n" + "\n".join(f"- {item}" for item in agenda),
+            "start": {"dateTime": start_time},
+            "end": {"dateTime": end_time},
+            "attendees": [{"email": email} for email in attendees],
+        }, f)
+    run_swytchcode(
+        "exec", "calendar.calendar.events.create",
+        "--body", "calendar_event.json",
+        "--input", f"calendarId={CALENDAR_ID}",
+        "--input", "sendUpdates=all",
+        "--json",
+    )
+    slack_notify(f"🗓️ New meeting scheduled with *{attendee_name}*" + (f" ({company})" if company else "") + f" on {meeting_date} — _{topic}_")
+
+    meeting = {
+        "id": meeting_id,
+        "attendee_name": attendee_name,
+        "attendee_email": attendee_email,
+        "company": company,
+        "topic": topic,
+        "context": context,
+        "status": "scheduled",
+    }
+    meetings.append(meeting)
+
+    memory = load_memory()
+    memory[meeting_id] = {
+        "status": "scheduled",
+        "agenda": agenda,
+        "start_time": start_time,
+        "scheduled_at": datetime.now().isoformat(),
+    }
+    save_memory(memory)
+
+    return {"meeting": meeting, "start_time": start_time, "end_time": end_time, "agenda": agenda}
 
 
 # --------------------------------------------------------------------------
