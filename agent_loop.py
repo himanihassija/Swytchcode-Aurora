@@ -64,6 +64,14 @@ SLACK_CHANNEL = "C0BNPFZ9YAX"
 # How long we'll wait after a summary before flagging the follow-up as "at risk"
 FOLLOWUP_RISK_HOURS = 24
 
+# --------------------------------------------------------------------------
+# Idempotency / retry policy: each pipeline stage (schedule / summarize /
+# follow-up) gets at most this many attempts per meeting. If the LLM keeps
+# returning unusable output past this cap, we stop auto-retrying and flag
+# the meeting instead of hammering the API forever.
+# --------------------------------------------------------------------------
+MAX_ATTEMPTS_PER_STAGE = 2
+
 # Estimated minutes saved per meeting on manual notes + follow-up (for the ROI counter)
 MINUTES_SAVED_PER_MEETING = 15
 
@@ -223,7 +231,7 @@ def save_memory(memory: dict):
 
 def ask_llm(prompt: str) -> str:
     response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
+        model="openai/gpt-oss-20b",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=1024,
     )
@@ -507,7 +515,30 @@ Respond in this exact JSON format, nothing else:
 {{"subject": "...", "body_html": "<p>...</p><p>...</p>"}}
 """
     email_content = ask_llm_json(prompt)
-    body_html = email_content.get("body_html", f"<p>Hi {meeting['attendee_name']},</p>")
+
+    if "body_html" in email_content:
+        body_html = email_content["body_html"]
+    else:
+        summary_text = summary_data.get("summary", "No summary was captured for this meeting.")
+        action_items = summary_data.get("action_items", [])
+        items_html = "".join(f"<li>{item}</li>" for item in action_items) or "<li>No action items were recorded.</li>"
+
+        body_html = (
+            f"<p>Hi {meeting['attendee_name']},</p>"
+            f"<p>Thanks for taking the time to meet with us today. Here's a quick recap "
+            f"of what we covered in <strong>{meeting['topic']}</strong>, so we're all aligned "
+            f"on what was discussed and what happens next.</p>"
+            f"<p>{summary_text}</p>"
+            f"<p>Here are the action items that came out of the discussion, along with who's "
+            f"driving each one forward:</p>"
+            f"<ul>{items_html}</ul>"
+            f"<p>If anything above looks off, or if there's context missing from this summary, "
+            f"just reply here and we'll get it sorted. Otherwise, we'll follow up again once "
+            f"these items are underway.</p>"
+            f"<p>Looking forward to keeping the momentum going.</p>"
+        )
+        print(f"\u26a0\ufe0f  Writer agent's LLM response didn't parse for {meeting['attendee_name']} "
+              f"\u2014 sent a data-based fallback email instead.")
 
     if AGENT_NAME not in body_html:
         body_html += f"<p style=\"color:#888;font-size:12px;\">Sent by {AGENT_NAME}</p>"
@@ -567,9 +598,15 @@ def stale_followup_rescue(memory: dict):
 # inside each meeting's own memory record, keep one running list across
 # ALL meetings with an owner + status, stored under memory["_action_item_tracker"].
 # --------------------------------------------------------------------------
-def parse_owner_and_item(raw_item: str) -> tuple:
+def parse_owner_and_item(raw_item) -> tuple:
     """Splits 'Rohan: ping support' into ('Rohan', 'ping support').
-    Falls back to 'Unassigned' if there's no clear 'Name: ...' prefix."""
+    Falls back to 'Unassigned' if there's no clear 'Name: ...' prefix.
+    Also handles cases where the LLM returns action items as dicts
+    (e.g. {"owner": "Rohan", "item": "ping support"}) instead of strings."""
+    if isinstance(raw_item, dict):
+        return raw_item.get("owner", "Unassigned"), str(raw_item.get("item", "")).strip()
+
+    raw_item = str(raw_item)
     if ":" in raw_item:
         owner, rest = raw_item.split(":", 1)
         owner = owner.strip()
@@ -725,51 +762,77 @@ def run_pipeline():
         # of always trusting the hardcoded seed status — this is what stops the
         # agent from re-scheduling/re-summarizing/re-sending on every re-run.
         effective_status = record.get("status", meeting["status"])
+        attempts = record.setdefault("attempts", {})
 
         print(f"\n=== {meeting['attendee_name']} ({meeting['company']}) — {meeting['topic']} ===")
 
         if effective_status == "upcoming":
-            print("🗓️  [Scheduler Agent] — proposing time + agenda...")
-            plan = scheduler_agent(meeting)
-            print("  →", plan)
-            record.update({"status": "scheduled", "agenda": plan.get("agenda", [])})
+            stage_attempts = attempts.get("schedule", 0)
+            if stage_attempts >= MAX_ATTEMPTS_PER_STAGE:
+                print(f"  🚫 Scheduler hit the {MAX_ATTEMPTS_PER_STAGE}-attempt policy limit — "
+                      f"leaving as 'upcoming', needs a manual look.")
+            else:
+                attempts["schedule"] = stage_attempts + 1
+                print(f"🗓️  [Scheduler Agent] — proposing time + agenda... (attempt {attempts['schedule']}/{MAX_ATTEMPTS_PER_STAGE})")
+                plan = scheduler_agent(meeting)
+                print("  →", plan)
+                if plan:
+                    record.update({"status": "scheduled", "agenda": plan.get("agenda", [])})
+                else:
+                    print("  ⚠️  Scheduler got no usable plan — will retry next run (if attempts remain).")
 
         elif effective_status == "needs_summary":
-            print("📝 [Summarizer Agent] — processing transcript...")
-            summary_data = summarizer_agent(meeting)
-            print("  →", summary_data)
-            record.update({
-                "status": "summarized",
-                "summary": summary_data.get("summary", ""),
-                "action_items": summary_data.get("action_items", []),
-                "summary_generated_at": datetime.now().isoformat(),
-            })
+            stage_attempts = attempts.get("summarize", 0)
+            if stage_attempts >= MAX_ATTEMPTS_PER_STAGE:
+                print(f"  🚫 Summarizer hit the {MAX_ATTEMPTS_PER_STAGE}-attempt policy limit — "
+                      f"leaving as 'needs_summary', needs a manual look.")
+            else:
+                attempts["summarize"] = stage_attempts + 1
+                print(f"📝 [Summarizer Agent] — processing transcript... (attempt {attempts['summarize']}/{MAX_ATTEMPTS_PER_STAGE})")
+                summary_data = summarizer_agent(meeting)
+                print("  →", summary_data)
 
-            print("📓 [Notes Agent] — posting meeting notes to Slack (Notion is down on their end)...")
-            post_meeting_notes_to_slack(meeting, summary_data)
+                if not summary_data.get("summary"):
+                    print("  ⚠️  Summarizer got no usable summary — will retry next run (if attempts remain).")
+                else:
+                    record.update({
+                        "status": "summarized",
+                        "summary": summary_data.get("summary", ""),
+                        "action_items": summary_data.get("action_items", []),
+                        "summary_generated_at": datetime.now().isoformat(),
+                    })
 
-            update_action_tracker(memory, meeting, summary_data.get("action_items", []))
+                    print("📓 [Notes Agent] — posting meeting notes to Slack (Notion is down on their end)...")
+                    post_meeting_notes_to_slack(meeting, summary_data)
+
+                    update_action_tracker(memory, meeting, summary_data.get("action_items", []))
 
         elif effective_status == "needs_followup":
-            print("✍️  [Writer Agent] — drafting + sending follow-up...")
-            # In a real run this summary would already be in memory from a prior pass.
-            summary_data = {
-                "summary": record.get("summary", (
-                    "The team confirmed a win on the enterprise workflow automation tender "
-                    "submitted last month, with onboarding conversations starting next week. "
-                    "The next step is preparing onboarding materials and assigning an internal "
-                    "point of contact so the new account gets a smooth handoff into delivery."
-                )),
-                "action_items": record.get("action_items", [
-                    "Priya: prepare onboarding materials for the tender client",
-                    "Rohan: assign an internal point of contact for the new account",
-                ]),
-            }
-            email_content = writer_agent(meeting, summary_data)
-            print("  →", email_content)
-            record["followup_sent_at"] = datetime.now().isoformat()
-            record["status"] = "followed_up"
-            update_action_tracker(memory, meeting, summary_data.get("action_items", []))
+            stage_attempts = attempts.get("followup", 0)
+            if stage_attempts >= MAX_ATTEMPTS_PER_STAGE:
+                print(f"  🚫 Writer hit the {MAX_ATTEMPTS_PER_STAGE}-attempt policy limit — "
+                      f"leaving as 'needs_followup', needs a manual look.")
+            else:
+                attempts["followup"] = stage_attempts + 1
+                print(f"✍️  [Writer Agent] — drafting + sending follow-up... (attempt {attempts['followup']}/{MAX_ATTEMPTS_PER_STAGE})")
+                # In a real run this summary would already be in memory from a prior pass.
+                summary_data = {
+                    "summary": record.get("summary", (
+                        "The team confirmed a win on the enterprise workflow automation tender "
+                        "submitted last month, with onboarding conversations starting next week. "
+                        "The next step is preparing onboarding materials and assigning an internal "
+                        "point of contact so the new account gets a smooth handoff into delivery."
+                    )),
+                    "action_items": record.get("action_items", [
+                        "Priya: prepare onboarding materials for the tender client",
+                        "Rohan: assign an internal point of contact for the new account",
+                    ]),
+                }
+                email_content = writer_agent(meeting, summary_data)
+                print("  →", email_content)
+                record["followup_sent_at"] = datetime.now().isoformat()
+                record["status"] = "followed_up"
+                update_action_tracker(memory, meeting, summary_data.get("action_items", []))
 
         else:
             print(f"  ⏭️  Already processed (status: {effective_status}) — skipping to avoid duplicates")
